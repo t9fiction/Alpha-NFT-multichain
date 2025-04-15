@@ -113,7 +113,8 @@ contract ONFTMarket is ONFT721, ERC721URIStorage, ReentrancyGuard, Ownable {
 
     // List an NFT for sale
     function listToken(uint256 tokenId, uint256 price) external nonReentrant {
-        if (!_exists(tokenId)) revert ONFTMarket__Errors.InvalidTokenId(tokenId);
+        if (!_exists(tokenId))
+            revert ONFTMarket__Errors.InvalidTokenId(tokenId);
         if (ownerOf(tokenId) != msg.sender)
             revert ONFTMarket__Errors.OnlyOwnerAllowed(msg.sender, tokenId);
         if (price <= 0) revert ONFTMarket__Errors.InvalidPrice(price);
@@ -131,7 +132,8 @@ contract ONFTMarket is ONFT721, ERC721URIStorage, ReentrancyGuard, Ownable {
 
     // Buy a listed NFT
     function createMarketSale(uint256 tokenId) external payable nonReentrant {
-        if (!_exists(tokenId)) revert ONFTMarket__Errors.InvalidTokenId(tokenId);
+        if (!_exists(tokenId))
+            revert ONFTMarket__Errors.InvalidTokenId(tokenId);
         MarketItem memory item = idToMarketItem[tokenId];
         if (!item.isListed) revert ONFTMarket__Errors.TokenNotListed(tokenId);
         if (msg.value < item.price)
@@ -173,7 +175,8 @@ contract ONFTMarket is ONFT721, ERC721URIStorage, ReentrancyGuard, Ownable {
 
     // Cancel a listing
     function cancelListing(uint256 tokenId) external nonReentrant {
-        if (!_exists(tokenId)) revert ONFTMarket__Errors.InvalidTokenId(tokenId);
+        if (!_exists(tokenId))
+            revert ONFTMarket__Errors.InvalidTokenId(tokenId);
         MarketItem memory item = idToMarketItem[tokenId];
         if (!item.isListed) revert ONFTMarket__Errors.TokenNotListed(tokenId);
         if (item.seller != msg.sender)
@@ -193,7 +196,8 @@ contract ONFTMarket is ONFT721, ERC721URIStorage, ReentrancyGuard, Ownable {
         uint256 tokenId,
         uint256 newPrice
     ) external nonReentrant {
-        if (!_exists(tokenId)) revert ONFTMarket__Errors.InvalidTokenId(tokenId);
+        if (!_exists(tokenId))
+            revert ONFTMarket__Errors.InvalidTokenId(tokenId);
         MarketItem memory item = idToMarketItem[tokenId];
         if (!item.isListed) revert ONFTMarket__Errors.TokenNotListed(tokenId);
         if (item.seller != msg.sender)
@@ -211,7 +215,8 @@ contract ONFTMarket is ONFT721, ERC721URIStorage, ReentrancyGuard, Ownable {
         uint256 tokenId,
         bytes calldata adapterParams
     ) external payable nonReentrant {
-        if (!_exists(tokenId)) revert ONFTMarket__Errors.InvalidTokenId(tokenId);
+        if (!_exists(tokenId))
+            revert ONFTMarket__Errors.InvalidTokenId(tokenId);
         if (ownerOf(tokenId) != msg.sender)
             revert ONFTMarket__Errors.OnlyOwnerAllowed(msg.sender, tokenId);
         if (idToMarketItem[tokenId].isListed)
@@ -323,14 +328,19 @@ contract ONFTMarket is ONFT721, ERC721URIStorage, ReentrancyGuard, Ownable {
     function fetchItemsListed() external view returns (MarketItem[] memory) {
         uint256 itemCount = 0;
         for (uint256 i = 1; i < _tokenIdCounter; i++) {
-            if (idToMarketItem[i].isListed && idToMarketItem[i].seller == msg.sender)
-                itemCount++;
+            if (
+                idToMarketItem[i].isListed &&
+                idToMarketItem[i].seller == msg.sender
+            ) itemCount++;
         }
 
         MarketItem[] memory items = new MarketItem[](itemCount);
         uint256 currentIndex = 0;
         for (uint256 i = 1; i < _tokenIdCounter; i++) {
-            if (idToMarketItem[i].isListed && idToMarketItem[i].seller == msg.sender) {
+            if (
+                idToMarketItem[i].isListed &&
+                idToMarketItem[i].seller == msg.sender
+            ) {
                 items[currentIndex] = idToMarketItem[i];
                 currentIndex++;
             }
@@ -343,7 +353,8 @@ contract ONFTMarket is ONFT721, ERC721URIStorage, ReentrancyGuard, Ownable {
     function getMarketItem(
         uint256 tokenId
     ) external view returns (MarketItem memory) {
-        if (!_exists(tokenId)) revert ONFTMarket__Errors.InvalidTokenId(tokenId);
+        if (!_exists(tokenId))
+            revert ONFTMarket__Errors.InvalidTokenId(tokenId);
         return idToMarketItem[tokenId];
     }
 
@@ -393,6 +404,13 @@ contract ONFTMarket is ONFT721, ERC721URIStorage, ReentrancyGuard, Ownable {
         address auth
     ) internal override(ONFT721, ERC721) returns (address) {
         return super._update(to, tokenId, auth);
+    }
+
+    function withdrawFees() external onlyOwner {
+        uint256 balance = address(this).balance;
+        (bool success, ) = owner().call{value: balance}("");
+        require(success, "Withdraw failed");
+        emit Withdrawn(owner(), balance);
     }
 
     // Fallback to receive ETH
