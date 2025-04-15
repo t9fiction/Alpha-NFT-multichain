@@ -1,13 +1,12 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.28;
 
-// import "hardhat/console.sol";
-
 import {IONFT721} from "@layerzerolabs/onft-evm/contracts/onft721/interfaces/IONFT721.sol";
 import {ONFT721Core} from "@layerzerolabs/onft-evm/contracts/onft721/ONFT721Core.sol";
 import {Ownable} from "@openzeppelin/contracts/access/Ownable.sol";
 import {ERC721} from "@openzeppelin/contracts/token/ERC721/ERC721.sol";
 import {ERC721URIStorage} from "@openzeppelin/contracts/token/ERC721/extensions/ERC721URIStorage.sol";
+import {ReentrancyGuard} from "@openzeppelin/contracts/security/ReentrancyGuard.sol";
 
 library ONFTMarket__Errors {
     error TokenAlreadyExists(uint256 tokenId);
@@ -16,12 +15,16 @@ library ONFTMarket__Errors {
     error TransferFailed();
     error OnlyOwnerAllowed(address caller, uint256 tokenId);
     error OnlySellerAllowed(address caller, uint256 tokenId);
+    error InvalidTokenId(uint256 tokenId);
 }
 
-contract ONFTMarket is ONFT721Core, IONFT721, ERC721URIStorage {
+contract ONFTMarket is ONFT721Core, IONFT721, ERC721URIStorage, ReentrancyGuard, Ownable {
     // Immutable variables
     uint private immutable CHAIN_ID;
-
+    
+    // Sequential token ID counter
+    uint256 private _tokenIdCounter;
+    
     // Events
     event TokenCreated(
         uint indexed tokenId,
@@ -50,9 +53,12 @@ contract ONFTMarket is ONFT721Core, IONFT721, ERC721URIStorage {
     );
 
     event LzReceive(bytes indexed payload);
+    
+    event ListingCancelled(uint indexed tokenId, address seller);
+    
+    event TokenResold(uint indexed tokenId, address seller, uint price);
 
     // MarketItem struct to represent a market item
-    // This struct is used to store information about each token in the marketplace
     struct MarketItem {
         uint tokenId;
         address payable seller;
@@ -73,8 +79,9 @@ contract ONFTMarket is ONFT721Core, IONFT721, ERC721URIStorage {
         uint _minGasToTransfer,
         address _lzEndpoint,
         uint _chainId
-    ) ERC721(_name, _symbol) ONFT721Core(_minGasToTransfer, _lzEndpoint) {
+    ) ERC721(_name, _symbol) ONFT721Core(_minGasToTransfer, _lzEndpoint) Ownable(msg.sender) {
         CHAIN_ID = _chainId;
+        _tokenIdCounter = 1; // Start token IDs at 1
     }
 
     function supportsInterface(
@@ -85,24 +92,17 @@ contract ONFTMarket is ONFT721Core, IONFT721, ERC721URIStorage {
             super.supportsInterface(interfaceId);
     }
 
-    //CreateToken
+    /**
+     * @dev Creates a new NFT token with sequential ID
+     * @param tokenURI Token URI pointing to metadata
+     * @param price Initial price of the token
+     */
     function createToken(
         string memory tokenURI,
         uint price
     ) external payable returns (uint) {
-        bytes32 hash = keccak256(
-            abi.encodePacked(
-                block.timestamp,
-                msg.sender,
-                blockhash(block.number - 1),
-                price
-            )
-        );
-        uint newTokenId = uint(hash) % 10000;
-
-        if(_exists(newTokenId)){
-            revert ONFTMarket__Errors.TokenAlreadyExists(newTokenId);
-        }
+        uint256 newTokenId = _tokenIdCounter;
+        _tokenIdCounter++;
 
         _mint(msg.sender, newTokenId);
         _setTokenURI(newTokenId, tokenURI);
@@ -121,7 +121,10 @@ contract ONFTMarket is ONFT721Core, IONFT721, ERC721URIStorage {
         return newTokenId;
     }
 
-    //createMarketSale
+    /**
+     * @dev Purchases an NFT that is listed on the marketplace
+     * @param tokenId Token ID to purchase
+     */
     function createMarketSale(uint tokenId) public payable nonReentrant {
         uint price = idToMarketItem[tokenId].price;
         uint marketValue = 0.00005 ether;
@@ -131,29 +134,32 @@ contract ONFTMarket is ONFT721Core, IONFT721, ERC721URIStorage {
             revert ONFTMarket__Errors.IncorrectPrice(totalAmount, msg.value);
         }
 
+        address payable seller = idToMarketItem[tokenId].seller;
+        
         idToMarketItem[tokenId].owner = payable(msg.sender);
         idToMarketItem[tokenId].sold = true;
         idToMarketItem[tokenId].seller = payable(address(0));
         _transfer(address(this), msg.sender, tokenId);
 
-        emit MarketSale(tokenId, idToMarketItem[tokenId].seller, msg.sender);
+        emit MarketSale(tokenId, seller, msg.sender);
 
-        (bool sellerTransferSuccess, ) = idToMarketItem[tokenId].seller.call{
-            value: price
-        }("");
+        (bool sellerTransferSuccess, ) = seller.call{value: price}("");
         if (!sellerTransferSuccess) {
             revert ONFTMarket__Errors.TransferFailed();
         }
 
-        (bool marketTransferSuccess, ) = address(this).call{value: marketValue}(
-            ""
-        );
+        (bool marketTransferSuccess, ) = address(this).call{value: marketValue}("");
         if (!marketTransferSuccess) {
             revert ONFTMarket__Errors.TransferFailed();
         }
     }
 
-    //SendONFT
+    /**
+     * @dev Sends an NFT to another chain using LayerZero
+     * @param destChainId Destination chain ID
+     * @param tokenId Token ID to send
+     * @param adapter Adapter parameters for LayerZero
+     */
     function sendOnft(
         uint16 destChainId,
         uint tokenId,
@@ -173,10 +179,8 @@ contract ONFTMarket is ONFT721Core, IONFT721, ERC721URIStorage {
 
         uint sendValue = 0.0001 ether;
 
-        //transfer value to contract
-        (bool appValueTransferSuccess, ) = address(this).call{value: sendValue}(
-            ""
-        );
+        // Transfer value to contract
+        (bool appValueTransferSuccess, ) = address(this).call{value: sendValue}("");
         if (!appValueTransferSuccess) {
             revert ONFTMarket__Errors.TransferFailed();
         }
@@ -214,10 +218,13 @@ contract ONFTMarket is ONFT721Core, IONFT721, ERC721URIStorage {
         bytes memory _payload
     ) internal override {
         emit LzReceive(_payload);
-
         reciveONFT(_payload);
     }
 
+    /**
+     * @dev Receives NFT from another chain
+     * @param _payload Encoded data from source chain
+     */
     function reciveONFT(bytes memory _payload) internal {
         (string memory _tokenURI, address _tokenOwner, uint _tokenId) = abi
             .decode(_payload, (string, address, uint));
@@ -243,7 +250,9 @@ contract ONFTMarket is ONFT721Core, IONFT721, ERC721URIStorage {
         emit TokenReceived(_tokenId, _tokenOwner, _tokenURI);
     }
 
-    //FetchMarketItems
+    /**
+     * @dev Fetches all market items available for sale
+     */
     function fetchMarketItems() external view returns (MarketItem[] memory) {
         uint itemCount = 0;
 
@@ -290,7 +299,9 @@ contract ONFTMarket is ONFT721Core, IONFT721, ERC721URIStorage {
         return items;
     }
 
-    /* Returns only items that a user has purchased */
+    /**
+     * @dev Fetches NFTs owned by the caller
+     */
     function fetchMyNFTs() external view returns (MarketItem[] memory) {
         uint itemCount = 0;
 
@@ -337,7 +348,9 @@ contract ONFTMarket is ONFT721Core, IONFT721, ERC721URIStorage {
         return items;
     }
 
-    /* Returns only items a user has listed */
+    /**
+     * @dev Fetches items listed by the caller
+     */
     function fetchItemsListed() external view returns (MarketItem[] memory) {
         uint itemCount = 0;
 
@@ -384,7 +397,10 @@ contract ONFTMarket is ONFT721Core, IONFT721, ERC721URIStorage {
         return items;
     }
 
-    //cancelListing
+    /**
+     * @dev Cancels an active listing
+     * @param tokenId Token ID to cancel
+     */
     function cancelListing(uint tokenId) external payable {
         if (idToMarketItem[tokenId].seller != msg.sender) {
             revert ONFTMarket__Errors.OnlySellerAllowed(msg.sender, tokenId);
@@ -396,9 +412,15 @@ contract ONFTMarket is ONFT721Core, IONFT721, ERC721URIStorage {
         idToMarketItem[tokenId].owner = payable(msg.sender);
 
         _transfer(address(this), msg.sender, tokenId);
+        
+        emit ListingCancelled(tokenId, msg.sender);
     }
 
-    //resellToken
+    /**
+     * @dev Puts a token back on sale
+     * @param tokenId Token ID to resell
+     * @param price New listing price
+     */
     function resellToken(uint tokenId, uint price) external payable {
         if (idToMarketItem[tokenId].owner != msg.sender) {
             revert ONFTMarket__Errors.OnlyOwnerAllowed(msg.sender, tokenId);
@@ -409,10 +431,47 @@ contract ONFTMarket is ONFT721Core, IONFT721, ERC721URIStorage {
         idToMarketItem[tokenId].seller = payable(msg.sender);
         idToMarketItem[tokenId].owner = payable(address(this));
         _transfer(msg.sender, address(this), tokenId);
+        
+        emit TokenResold(tokenId, msg.sender, price);
     }
 
+    /**
+     * @dev Updates price for a token
+     * @param tokenId Token ID to update
+     * @param newPrice New price
+     */
+    function updateTokenPrice(uint tokenId, uint newPrice) external {
+        if (idToMarketItem[tokenId].seller != msg.sender) {
+            revert ONFTMarket__Errors.OnlySellerAllowed(msg.sender, tokenId);
+        }
+        
+        idToMarketItem[tokenId].price = newPrice;
+    }
+    
+    /**
+     * @dev Gets details for a specific token
+     * @param tokenId Token ID to query
+     */
+    function getMarketItem(uint tokenId) external view returns (MarketItem memory) {
+        if (!_exists(tokenId)) {
+            revert ONFTMarket__Errors.InvalidTokenId(tokenId);
+        }
+        return idToMarketItem[tokenId];
+    }
+    
+    /**
+     * @dev Gets current token ID counter value
+     * @return Current token counter value
+     */
+    function getCurrentTokenId() external view returns (uint256) {
+        return _tokenIdCounter;
+    }
+
+    /**
+     * @dev Withdraws contract balance to owner
+     */
     function withdraw() public payable onlyOwner {
-        (bool success, ) = payable(msg.sender).call{
+        (bool success, ) = payable(owner()).call{
             value: address(this).balance
         }("");
         if (!success) {
@@ -420,5 +479,35 @@ contract ONFTMarket is ONFT721Core, IONFT721, ERC721URIStorage {
         }
     }
 
+    /**
+     * @dev Override _update from ERC721 to ensure proper updating of URI info
+     */
+    function _update(address to, uint256 tokenId, address auth)
+        internal
+        override
+        returns (address)
+    {
+        return super._update(to, tokenId, auth);
+    }
+
+    /**
+     * @dev Override tokenURI function to combine ERC721URIStorage with custom handling
+     */
+    function tokenURI(uint256 tokenId)
+        public
+        view
+        override(ERC721, ERC721URIStorage)
+        returns (string memory)
+    {
+        return super.tokenURI(tokenId);
+    }
+    
+    /**
+     * @dev Override _burn function
+     */
+    function _burn(uint256 tokenId) internal override(ERC721, ERC721URIStorage) {
+        super._burn(tokenId);
+    }
+    
     receive() external payable {}
 }
