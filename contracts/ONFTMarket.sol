@@ -1,13 +1,12 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.28;
 
-import {IONFT721} from "@layerzerolabs/onft-evm/contracts/onft721/interfaces/IONFT721.sol";
-import {ONFT721Core} from "@layerzerolabs/onft-evm/contracts/onft721/ONFT721Core.sol";
+import {ONFT721} from "@layerzerolabs/lz-evm-oapp-v2/contracts/onft721/ONFT721.sol";
 import {Ownable} from "@openzeppelin/contracts/access/Ownable.sol";
-import {ERC721} from "@openzeppelin/contracts/token/ERC721/ERC721.sol";
 import {ERC721URIStorage} from "@openzeppelin/contracts/token/ERC721/extensions/ERC721URIStorage.sol";
-import {ReentrancyGuard} from "@openzeppelin/contracts/security/ReentrancyGuard.sol";
+import {ReentrancyGuard} from "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
 
+// Custom errors
 library ONFTMarket__Errors {
     error TokenAlreadyExists(uint256 tokenId);
     error Unauthorized(address caller);
@@ -16,498 +15,386 @@ library ONFTMarket__Errors {
     error OnlyOwnerAllowed(address caller, uint256 tokenId);
     error OnlySellerAllowed(address caller, uint256 tokenId);
     error InvalidTokenId(uint256 tokenId);
+    error TokenNotListed(uint256 tokenId);
+    error TokenAlreadyListed(uint256 tokenId);
+    error InsufficientFee(uint256 required, uint256 provided);
+    error InvalidPrice(uint256 price);
 }
 
-contract ONFTMarket is ONFT721Core, IONFT721, ERC721URIStorage, ReentrancyGuard, Ownable {
-    // Immutable variables
-    uint private immutable CHAIN_ID;
-    
+// Multichain NFT Marketplace using LayerZero V2 ONFT721
+contract ONFTMarket is ONFT721, ERC721URIStorage, ReentrancyGuard, Ownable {
+    // Immutable chain ID
+    uint256 private immutable CHAIN_ID;
+
     // Sequential token ID counter
     uint256 private _tokenIdCounter;
-    
-    // Events
-    event TokenCreated(
-        uint indexed tokenId,
-        address indexed owner,
-        string tokenURI,
-        uint price
-    );
 
-    event TokenSent(
-        uint indexed tokenId,
-        address indexed sender,
-        uint16 indexed dstChainId,
-        string tokenURI
-    );
+    // Marketplace fee in basis points (e.g., 250 = 2.5%)
+    uint256 public constant FEE_BPS = 250;
+    uint256 public constant BPS_DENOMINATOR = 10000;
 
-    event TokenReceived(
-        uint indexed tokenId,
-        address indexed sender,
-        string tokenURI
-    );
-
-    event MarketSale(
-        uint indexed tokenId,
-        address indexed seller,
-        address indexed owner
-    );
-
-    event LzReceive(bytes indexed payload);
-    
-    event ListingCancelled(uint indexed tokenId, address seller);
-    
-    event TokenResold(uint indexed tokenId, address seller, uint price);
-
-    // MarketItem struct to represent a market item
+    // Struct for market listings
     struct MarketItem {
-        uint tokenId;
-        address payable seller;
-        address payable owner;
-        uint price;
-        bool sold;
-        uint creationTimestamp;
+        uint256 tokenId;
+        address seller;
+        uint256 price;
+        bool isListed;
     }
 
-    mapping(uint => MarketItem) private idToMarketItem;
-    mapping(uint => address) private lockedOwnerToken;
-    mapping(uint => uint[]) private rangeToTokens;
-    mapping(uint => uint[]) private lengthMarketTokens;
+    // Mapping of tokenId to listing
+    mapping(uint256 => MarketItem) public idToMarketItem;
 
+    // Events
+    event TokenCreated(
+        uint256 indexed tokenId,
+        address indexed owner,
+        string tokenURI,
+        uint256 price
+    );
+    event TokenListed(
+        uint256 indexed tokenId,
+        address indexed seller,
+        uint256 price
+    );
+    event TokenSold(
+        uint256 indexed tokenId,
+        address indexed seller,
+        address indexed buyer,
+        uint256 price
+    );
+    event ListingCancelled(uint256 indexed tokenId, address indexed seller);
+    event TokenPriceUpdated(uint256 indexed tokenId, uint256 newPrice);
+    event TokenBridged(
+        uint256 indexed tokenId,
+        address indexed owner,
+        uint32 dstEid,
+        string tokenURI
+    );
+    event TokenReceived(
+        uint256 indexed tokenId,
+        address indexed owner,
+        string tokenURI
+    );
+    event Withdrawn(address indexed owner, uint256 amount);
+
+    // Constructor
     constructor(
         string memory _name,
         string memory _symbol,
-        uint _minGasToTransfer,
         address _lzEndpoint,
-        uint _chainId
-    ) ERC721(_name, _symbol) ONFT721Core(_minGasToTransfer, _lzEndpoint) Ownable(msg.sender) {
+        address _owner,
+        uint256 _chainId
+    ) ONFT721(_name, _symbol, _lzEndpoint, _owner) Ownable(_owner) {
         CHAIN_ID = _chainId;
-        _tokenIdCounter = 1; // Start token IDs at 1
+        _tokenIdCounter = 1;
     }
 
+    // Create a new NFT
+    function createToken(
+        string memory tokenURI,
+        uint256 price
+    ) external nonReentrant returns (uint256) {
+        if (price <= 0) revert ONFTMarket__Errors.InvalidPrice(price);
+
+        uint256 newTokenId = _tokenIdCounter++;
+        _safeMint(msg.sender, newTokenId);
+        _setTokenURI(newTokenId, tokenURI);
+
+        idToMarketItem[newTokenId] = MarketItem({
+            tokenId: newTokenId,
+            seller: address(0),
+            price: price,
+            isListed: false
+        });
+
+        emit TokenCreated(newTokenId, msg.sender, tokenURI, price);
+        return newTokenId;
+    }
+
+    // List an NFT for sale
+    function listToken(uint256 tokenId, uint256 price) external nonReentrant {
+        if (!_exists(tokenId)) revert ONFTMarket__Errors.InvalidTokenId(tokenId);
+        if (ownerOf(tokenId) != msg.sender)
+            revert ONFTMarket__Errors.OnlyOwnerAllowed(msg.sender, tokenId);
+        if (price <= 0) revert ONFTMarket__Errors.InvalidPrice(price);
+        if (idToMarketItem[tokenId].isListed)
+            revert ONFTMarket__Errors.TokenAlreadyListed(tokenId);
+
+        idToMarketItem[tokenId].seller = msg.sender;
+        idToMarketItem[tokenId].price = price;
+        idToMarketItem[tokenId].isListed = true;
+
+        _transfer(msg.sender, address(this), tokenId);
+
+        emit TokenListed(tokenId, msg.sender, price);
+    }
+
+    // Buy a listed NFT
+    function createMarketSale(uint256 tokenId) external payable nonReentrant {
+        if (!_exists(tokenId)) revert ONFTMarket__Errors.InvalidTokenId(tokenId);
+        MarketItem memory item = idToMarketItem[tokenId];
+        if (!item.isListed) revert ONFTMarket__Errors.TokenNotListed(tokenId);
+        if (msg.value < item.price)
+            revert ONFTMarket__Errors.IncorrectPrice(item.price, msg.value);
+
+        address seller = item.seller;
+        uint256 price = item.price;
+
+        // Calculate fee and seller proceeds
+        uint256 fee = (price * FEE_BPS) / BPS_DENOMINATOR;
+        uint256 sellerProceeds = price - fee;
+
+        // Update listing
+        idToMarketItem[tokenId].seller = address(0);
+        idToMarketItem[tokenId].price = 0;
+        idToMarketItem[tokenId].isListed = false;
+
+        // Transfer NFT to buyer
+        _transfer(address(this), msg.sender, tokenId);
+
+        // Transfer proceeds to seller
+        (bool sellerSuccess, ) = seller.call{value: sellerProceeds}("");
+        if (!sellerSuccess) revert ONFTMarket__Errors.TransferFailed();
+
+        // Transfer fee to contract (for owner withdrawal)
+        (bool feeSuccess, ) = address(this).call{value: fee}("");
+        if (!feeSuccess) revert ONFTMarket__Errors.TransferFailed();
+
+        // Refund excess payment
+        if (msg.value > price) {
+            (bool refundSuccess, ) = msg.sender.call{value: msg.value - price}(
+                ""
+            );
+            if (!refundSuccess) revert ONFTMarket__Errors.TransferFailed();
+        }
+
+        emit TokenSold(tokenId, seller, msg.sender, price);
+    }
+
+    // Cancel a listing
+    function cancelListing(uint256 tokenId) external nonReentrant {
+        if (!_exists(tokenId)) revert ONFTMarket__Errors.InvalidTokenId(tokenId);
+        MarketItem memory item = idToMarketItem[tokenId];
+        if (!item.isListed) revert ONFTMarket__Errors.TokenNotListed(tokenId);
+        if (item.seller != msg.sender)
+            revert ONFTMarket__Errors.OnlySellerAllowed(msg.sender, tokenId);
+
+        idToMarketItem[tokenId].seller = address(0);
+        idToMarketItem[tokenId].price = 0;
+        idToMarketItem[tokenId].isListed = false;
+
+        _transfer(address(this), msg.sender, tokenId);
+
+        emit ListingCancelled(tokenId, msg.sender);
+    }
+
+    // Update listing price
+    function updateTokenPrice(
+        uint256 tokenId,
+        uint256 newPrice
+    ) external nonReentrant {
+        if (!_exists(tokenId)) revert ONFTMarket__Errors.InvalidTokenId(tokenId);
+        MarketItem memory item = idToMarketItem[tokenId];
+        if (!item.isListed) revert ONFTMarket__Errors.TokenNotListed(tokenId);
+        if (item.seller != msg.sender)
+            revert ONFTMarket__Errors.OnlySellerAllowed(msg.sender, tokenId);
+        if (newPrice <= 0) revert ONFTMarket__Errors.InvalidPrice(newPrice);
+
+        idToMarketItem[tokenId].price = newPrice;
+
+        emit TokenPriceUpdated(tokenId, newPrice);
+    }
+
+    // Bridge NFT to another chain
+    function sendOnft(
+        uint32 dstEid,
+        uint256 tokenId,
+        bytes calldata adapterParams
+    ) external payable nonReentrant {
+        if (!_exists(tokenId)) revert ONFTMarket__Errors.InvalidTokenId(tokenId);
+        if (ownerOf(tokenId) != msg.sender)
+            revert ONFTMarket__Errors.OnlyOwnerAllowed(msg.sender, tokenId);
+        if (idToMarketItem[tokenId].isListed)
+            revert ONFTMarket__Errors.TokenAlreadyListed(tokenId);
+
+        string memory tokenURI = tokenURI(tokenId);
+
+        // Estimate LayerZero fees
+        (uint256 nativeFee, ) = estimateSendFee(
+            dstEid,
+            msg.sender,
+            tokenId,
+            false,
+            adapterParams
+        );
+        if (msg.value < nativeFee)
+            revert ONFTMarket__Errors.InsufficientFee(nativeFee, msg.value);
+
+        // Perform cross-chain transfer
+        _lzSend(
+            dstEid,
+            msg.sender,
+            tokenId,
+            false,
+            adapterParams,
+            msg.value,
+            payable(msg.sender)
+        );
+
+        emit TokenBridged(tokenId, msg.sender, dstEid, tokenURI);
+    }
+
+    // Override _debitFrom for cross-chain burn
+    function _debitFrom(
+        address _from,
+        uint16,
+        bytes memory,
+        uint256 _tokenId
+    ) internal virtual override {
+        if (!_exists(_tokenId))
+            revert ONFTMarket__Errors.InvalidTokenId(_tokenId);
+        if (ownerOf(_tokenId) != _from)
+            revert ONFTMarket__Errors.OnlyOwnerAllowed(_from, _tokenId);
+        if (idToMarketItem[_tokenId].isListed)
+            revert ONFTMarket__Errors.TokenAlreadyListed(_tokenId);
+
+        _burn(_tokenId);
+    }
+
+    // Override _creditTo for cross-chain mint
+    function _creditTo(
+        uint16,
+        address _toAddress,
+        uint256 _tokenId
+    ) internal virtual override {
+        _safeMint(_toAddress, _tokenId);
+
+        // Restore token URI and market item (if it exists)
+        string memory tokenURI = tokenURI(_tokenId);
+        idToMarketItem[_tokenId] = MarketItem({
+            tokenId: _tokenId,
+            seller: address(0),
+            price: 0,
+            isListed: false
+        });
+
+        emit TokenReceived(_tokenId, _toAddress, tokenURI);
+    }
+
+    // Fetch all listed market items
+    function fetchMarketItems() external view returns (MarketItem[] memory) {
+        uint256 itemCount = 0;
+        for (uint256 i = 1; i < _tokenIdCounter; i++) {
+            if (idToMarketItem[i].isListed) itemCount++;
+        }
+
+        MarketItem[] memory items = new MarketItem[](itemCount);
+        uint256 currentIndex = 0;
+        for (uint256 i = 1; i < _tokenIdCounter; i++) {
+            if (idToMarketItem[i].isListed) {
+                items[currentIndex] = idToMarketItem[i];
+                currentIndex++;
+            }
+        }
+
+        return items;
+    }
+
+    // Fetch NFTs owned by the caller
+    function fetchMyNFTs() external view returns (MarketItem[] memory) {
+        uint256 itemCount = 0;
+        for (uint256 i = 1; i < _tokenIdCounter; i++) {
+            if (_exists(i) && ownerOf(i) == msg.sender) itemCount++;
+        }
+
+        MarketItem[] memory items = new MarketItem[](itemCount);
+        uint256 currentIndex = 0;
+        for (uint256 i = 1; i < _tokenIdCounter; i++) {
+            if (_exists(i) && ownerOf(i) == msg.sender) {
+                items[currentIndex] = idToMarketItem[i];
+                currentIndex++;
+            }
+        }
+
+        return items;
+    }
+
+    // Fetch items listed by the caller
+    function fetchItemsListed() external view returns (MarketItem[] memory) {
+        uint256 itemCount = 0;
+        for (uint256 i = 1; i < _tokenIdCounter; i++) {
+            if (idToMarketItem[i].isListed && idToMarketItem[i].seller == msg.sender)
+                itemCount++;
+        }
+
+        MarketItem[] memory items = new MarketItem[](itemCount);
+        uint256 currentIndex = 0;
+        for (uint256 i = 1; i < _tokenIdCounter; i++) {
+            if (idToMarketItem[i].isListed && idToMarketItem[i].seller == msg.sender) {
+                items[currentIndex] = idToMarketItem[i];
+                currentIndex++;
+            }
+        }
+
+        return items;
+    }
+
+    // Get market item details
+    function getMarketItem(
+        uint256 tokenId
+    ) external view returns (MarketItem memory) {
+        if (!_exists(tokenId)) revert ONFTMarket__Errors.InvalidTokenId(tokenId);
+        return idToMarketItem[tokenId];
+    }
+
+    // Get current token ID counter
+    function getCurrentTokenId() external view returns (uint256) {
+        return _tokenIdCounter;
+    }
+
+    // Withdraw contract balance
+    function withdraw() external onlyOwner nonReentrant {
+        uint256 balance = address(this).balance;
+        if (balance == 0) revert ONFTMarket__Errors.TransferFailed();
+
+        (bool success, ) = owner().call{value: balance}("");
+        if (!success) revert ONFTMarket__Errors.TransferFailed();
+
+        emit Withdrawn(owner(), balance);
+    }
+
+    // Override supportsInterface
     function supportsInterface(
         bytes4 interfaceId
-    ) public view virtual override(ONFT721Core, ERC721) returns (bool) {
+    ) public view virtual override(ONFT721, ERC721) returns (bool) {
         return
             interfaceId == type(IONFT721).interfaceId ||
             super.supportsInterface(interfaceId);
     }
 
-    /**
-     * @dev Creates a new NFT token with sequential ID
-     * @param tokenURI Token URI pointing to metadata
-     * @param price Initial price of the token
-     */
-    function createToken(
-        string memory tokenURI,
-        uint price
-    ) external payable returns (uint) {
-        uint256 newTokenId = _tokenIdCounter;
-        _tokenIdCounter++;
-
-        _mint(msg.sender, newTokenId);
-        _setTokenURI(newTokenId, tokenURI);
-        emit TokenCreated(newTokenId, msg.sender, tokenURI, price);
-
-        idToMarketItem[newTokenId] = MarketItem(
-            newTokenId,
-            payable(address(0)),
-            payable(msg.sender),
-            price,
-            false,
-            block.timestamp
-        );
-        lengthMarketTokens[CHAIN_ID].push(newTokenId);
-
-        return newTokenId;
+    // Override tokenURI
+    function tokenURI(
+        uint256 tokenId
+    ) public view override(ONFT721, ERC721URIStorage) returns (string memory) {
+        return super.tokenURI(tokenId);
     }
 
-    /**
-     * @dev Purchases an NFT that is listed on the marketplace
-     * @param tokenId Token ID to purchase
-     */
-    function createMarketSale(uint tokenId) public payable nonReentrant {
-        uint price = idToMarketItem[tokenId].price;
-        uint marketValue = 0.00005 ether;
-        uint totalAmount = price + marketValue;
-        
-        if (msg.value != totalAmount) {
-            revert ONFTMarket__Errors.IncorrectPrice(totalAmount, msg.value);
-        }
-
-        address payable seller = idToMarketItem[tokenId].seller;
-        
-        idToMarketItem[tokenId].owner = payable(msg.sender);
-        idToMarketItem[tokenId].sold = true;
-        idToMarketItem[tokenId].seller = payable(address(0));
-        _transfer(address(this), msg.sender, tokenId);
-
-        emit MarketSale(tokenId, seller, msg.sender);
-
-        (bool sellerTransferSuccess, ) = seller.call{value: price}("");
-        if (!sellerTransferSuccess) {
-            revert ONFTMarket__Errors.TransferFailed();
-        }
-
-        (bool marketTransferSuccess, ) = address(this).call{value: marketValue}("");
-        if (!marketTransferSuccess) {
-            revert ONFTMarket__Errors.TransferFailed();
-        }
+    // Override _burn
+    function _burn(
+        uint256 tokenId
+    ) internal override(ONFT721, ERC721URIStorage) {
+        super._burn(tokenId);
     }
 
-    /**
-     * @dev Sends an NFT to another chain using LayerZero
-     * @param destChainId Destination chain ID
-     * @param tokenId Token ID to send
-     * @param adapter Adapter parameters for LayerZero
-     */
-    function sendOnft(
-        uint16 destChainId,
-        uint tokenId,
-        bytes memory adapter
-    ) external payable nonReentrant {
-        if (idToMarketItem[tokenId].owner != msg.sender) {
-            revert ONFTMarket__Errors.OnlyOwnerAllowed(msg.sender, tokenId);
-        }
-
-        string memory _tokenURI = tokenURI(tokenId);
-        address _tokenOwner = ownerOf(tokenId);
-        bytes memory payload = abi.encode(_tokenURI, _tokenOwner, tokenId);
-
-        lockedOwnerToken[tokenId] = _tokenOwner;
-        idToMarketItem[tokenId].owner = payable(address(0));
-        transferFrom(msg.sender, address(this), tokenId);
-
-        uint sendValue = 0.0001 ether;
-
-        // Transfer value to contract
-        (bool appValueTransferSuccess, ) = address(this).call{value: sendValue}("");
-        if (!appValueTransferSuccess) {
-            revert ONFTMarket__Errors.TransferFailed();
-        }
-
-        uint bridgeValue = msg.value - sendValue;
-
-        emit TokenSent(tokenId, msg.sender, destChainId, _tokenURI);
-        _lzSend(
-            destChainId,
-            payload,
-            payable(msg.sender),
-            address(0x0),
-            adapter,
-            bridgeValue
-        );
-    }
-
-    function _debitFrom(
-        address _from,
-        uint16,
-        bytes memory,
-        uint _tokenId
-    ) internal virtual override {}
-
-    function _creditTo(
-        uint16,
-        address _toAddress,
-        uint _tokenId
-    ) internal virtual override {}
-
-    function _nonblockingLzReceive(
-        uint16,
-        bytes memory,
-        uint64,
-        bytes memory _payload
-    ) internal override {
-        emit LzReceive(_payload);
-        reciveONFT(_payload);
-    }
-
-    /**
-     * @dev Receives NFT from another chain
-     * @param _payload Encoded data from source chain
-     */
-    function reciveONFT(bytes memory _payload) internal {
-        (string memory _tokenURI, address _tokenOwner, uint _tokenId) = abi
-            .decode(_payload, (string, address, uint));
-
-        if (lockedOwnerToken[_tokenId] == _tokenOwner) {
-            idToMarketItem[_tokenId].owner = payable(_tokenOwner);
-            transferFrom(address(this), _tokenOwner, _tokenId);
-        } else {
-            {
-                _safeMint(_tokenOwner, _tokenId);
-                _setTokenURI(_tokenId, _tokenURI);
-                idToMarketItem[_tokenId] = MarketItem(
-                    _tokenId,
-                    payable(address(0)),
-                    payable(_tokenOwner),
-                    0,
-                    false,
-                    block.timestamp
-                );
-                rangeToTokens[CHAIN_ID].push(_tokenId);
-            }
-        }
-        emit TokenReceived(_tokenId, _tokenOwner, _tokenURI);
-    }
-
-    /**
-     * @dev Fetches all market items available for sale
-     */
-    function fetchMarketItems() external view returns (MarketItem[] memory) {
-        uint itemCount = 0;
-
-        uint[] memory tokensInMarket = lengthMarketTokens[CHAIN_ID];
-
-        for (uint i = 0; i < tokensInMarket.length; i++) {
-            uint tokenId = tokensInMarket[i];
-            if (idToMarketItem[tokenId].owner == address(this)) {
-                itemCount += 1;
-            }
-        }
-
-        // Loop through the tokens received from other chains
-        uint[] memory tokensInCurrentRange = rangeToTokens[CHAIN_ID];
-        for (uint i = 0; i < tokensInCurrentRange.length; i++) {
-            uint currentId = tokensInCurrentRange[i];
-            if (idToMarketItem[currentId].owner == address(this)) {
-                itemCount += 1;
-            }
-        }
-
-        // Initialize the items array with the calculated itemCount
-        MarketItem[] memory items = new MarketItem[](itemCount);
-
-        // Loop through your own NFTs on the current chain
-        uint currentIndex = 0;
-        for (uint i = 0; i < tokensInMarket.length; i++) {
-            uint tokenId = tokensInMarket[i];
-            if (idToMarketItem[tokenId].owner == address(this)) {
-                items[currentIndex] = idToMarketItem[tokenId];
-                currentIndex += 1;
-            }
-        }
-
-        // Loop through the tokens received from other chains
-        for (uint i = 0; i < tokensInCurrentRange.length; i++) {
-            uint currentId = tokensInCurrentRange[i];
-            if (idToMarketItem[currentId].owner == address(this)) {
-                items[currentIndex] = idToMarketItem[currentId];
-                currentIndex += 1;
-            }
-        }
-
-        return items;
-    }
-
-    /**
-     * @dev Fetches NFTs owned by the caller
-     */
-    function fetchMyNFTs() external view returns (MarketItem[] memory) {
-        uint itemCount = 0;
-
-        uint[] memory tokensInMarket = lengthMarketTokens[CHAIN_ID];
-
-        for (uint i = 0; i < tokensInMarket.length; i++) {
-            uint tokenId = tokensInMarket[i];
-            if (idToMarketItem[tokenId].owner == msg.sender) {
-                itemCount += 1;
-            }
-        }
-
-        // Loop through the tokens received from other chains
-        uint[] memory tokensInCurrentRange = rangeToTokens[CHAIN_ID];
-        for (uint i = 0; i < tokensInCurrentRange.length; i++) {
-            uint currentId = tokensInCurrentRange[i];
-            if (idToMarketItem[currentId].owner == msg.sender) {
-                itemCount += 1;
-            }
-        }
-
-        // Initialize the items array with the calculated itemCount
-        MarketItem[] memory items = new MarketItem[](itemCount);
-
-        // Loop through your own NFTs on the current chain
-        uint currentIndex = 0;
-        for (uint i = 0; i < tokensInMarket.length; i++) {
-            uint tokenId = tokensInMarket[i];
-            if (idToMarketItem[tokenId].owner == msg.sender) {
-                items[currentIndex] = idToMarketItem[tokenId];
-                currentIndex += 1;
-            }
-        }
-
-        // Loop through the tokens received from other chains
-        for (uint i = 0; i < tokensInCurrentRange.length; i++) {
-            uint currentId = tokensInCurrentRange[i];
-            if (idToMarketItem[currentId].owner == msg.sender) {
-                items[currentIndex] = idToMarketItem[currentId];
-                currentIndex += 1;
-            }
-        }
-
-        return items;
-    }
-
-    /**
-     * @dev Fetches items listed by the caller
-     */
-    function fetchItemsListed() external view returns (MarketItem[] memory) {
-        uint itemCount = 0;
-
-        uint[] memory tokensInMarket = lengthMarketTokens[CHAIN_ID];
-
-        for (uint i = 0; i < tokensInMarket.length; i++) {
-            uint tokenId = tokensInMarket[i];
-            if (idToMarketItem[tokenId].seller == msg.sender) {
-                itemCount += 1;
-            }
-        }
-
-        // Loop through the tokens received from other chains
-        uint[] memory tokensInCurrentRange = rangeToTokens[CHAIN_ID];
-        for (uint i = 0; i < tokensInCurrentRange.length; i++) {
-            uint currentId = tokensInCurrentRange[i];
-            if (idToMarketItem[currentId].seller == msg.sender) {
-                itemCount += 1;
-            }
-        }
-
-        // Initialize the items array with the calculated itemCount
-        MarketItem[] memory items = new MarketItem[](itemCount);
-
-        // Loop through your own NFTs on the current chain
-        uint currentIndex = 0;
-        for (uint i = 0; i < tokensInMarket.length; i++) {
-            uint tokenId = tokensInMarket[i];
-            if (idToMarketItem[tokenId].seller == msg.sender) {
-                items[currentIndex] = idToMarketItem[tokenId];
-                currentIndex += 1;
-            }
-        }
-
-        // Loop through the tokens received from other chains
-        for (uint i = 0; i < tokensInCurrentRange.length; i++) {
-            uint currentId = tokensInCurrentRange[i];
-            if (idToMarketItem[currentId].seller == msg.sender) {
-                items[currentIndex] = idToMarketItem[currentId];
-                currentIndex += 1;
-            }
-        }
-
-        return items;
-    }
-
-    /**
-     * @dev Cancels an active listing
-     * @param tokenId Token ID to cancel
-     */
-    function cancelListing(uint tokenId) external payable {
-        if (idToMarketItem[tokenId].seller != msg.sender) {
-            revert ONFTMarket__Errors.OnlySellerAllowed(msg.sender, tokenId);
-        }
-
-        idToMarketItem[tokenId].sold = false;
-        idToMarketItem[tokenId].price = 0;
-        idToMarketItem[tokenId].seller = payable(address(0));
-        idToMarketItem[tokenId].owner = payable(msg.sender);
-
-        _transfer(address(this), msg.sender, tokenId);
-        
-        emit ListingCancelled(tokenId, msg.sender);
-    }
-
-    /**
-     * @dev Puts a token back on sale
-     * @param tokenId Token ID to resell
-     * @param price New listing price
-     */
-    function resellToken(uint tokenId, uint price) external payable {
-        if (idToMarketItem[tokenId].owner != msg.sender) {
-            revert ONFTMarket__Errors.OnlyOwnerAllowed(msg.sender, tokenId);
-        }
-
-        idToMarketItem[tokenId].sold = false;
-        idToMarketItem[tokenId].price = price;
-        idToMarketItem[tokenId].seller = payable(msg.sender);
-        idToMarketItem[tokenId].owner = payable(address(this));
-        _transfer(msg.sender, address(this), tokenId);
-        
-        emit TokenResold(tokenId, msg.sender, price);
-    }
-
-    /**
-     * @dev Updates price for a token
-     * @param tokenId Token ID to update
-     * @param newPrice New price
-     */
-    function updateTokenPrice(uint tokenId, uint newPrice) external {
-        if (idToMarketItem[tokenId].seller != msg.sender) {
-            revert ONFTMarket__Errors.OnlySellerAllowed(msg.sender, tokenId);
-        }
-        
-        idToMarketItem[tokenId].price = newPrice;
-    }
-    
-    /**
-     * @dev Gets details for a specific token
-     * @param tokenId Token ID to query
-     */
-    function getMarketItem(uint tokenId) external view returns (MarketItem memory) {
-        if (!_exists(tokenId)) {
-            revert ONFTMarket__Errors.InvalidTokenId(tokenId);
-        }
-        return idToMarketItem[tokenId];
-    }
-    
-    /**
-     * @dev Gets current token ID counter value
-     * @return Current token counter value
-     */
-    function getCurrentTokenId() external view returns (uint256) {
-        return _tokenIdCounter;
-    }
-
-    /**
-     * @dev Withdraws contract balance to owner
-     */
-    function withdraw() public payable onlyOwner {
-        (bool success, ) = payable(owner()).call{
-            value: address(this).balance
-        }("");
-        if (!success) {
-            revert ONFTMarket__Errors.TransferFailed();
-        }
-    }
-
-    /**
-     * @dev Override _update from ERC721 to ensure proper updating of URI info
-     */
-    function _update(address to, uint256 tokenId, address auth)
-        internal
-        override
-        returns (address)
-    {
+    // Override _update
+    function _update(
+        address to,
+        uint256 tokenId,
+        address auth
+    ) internal override(ONFT721, ERC721) returns (address) {
         return super._update(to, tokenId, auth);
     }
 
-    /**
-     * @dev Override tokenURI function to combine ERC721URIStorage with custom handling
-     */
-    function tokenURI(uint256 tokenId)
-        public
-        view
-        override(ERC721, ERC721URIStorage)
-        returns (string memory)
-    {
-        return super.tokenURI(tokenId);
-    }
-    
-    /**
-     * @dev Override _burn function
-     */
-    function _burn(uint256 tokenId) internal override(ERC721, ERC721URIStorage) {
-        super._burn(tokenId);
-    }
-    
+    // Fallback to receive ETH
     receive() external payable {}
 }
